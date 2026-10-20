@@ -4,6 +4,16 @@ on:
     branches: [master]
   pull_request:
 jobs:
+  visionos-core:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test engine-free Swift package
+        working-directory: visionos-app
+        run: |
+          swift --version
+          swift build
+          swift test
   plugin:
     runs-on: ubuntu-latest
     steps:

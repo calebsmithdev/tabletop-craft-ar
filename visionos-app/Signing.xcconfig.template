@@ -1,0 +1,2 @@
+// Copy to Signing.xcconfig and set your own team for device builds.
+DEVELOPMENT_TEAM =

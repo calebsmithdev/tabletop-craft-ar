@@ -1,0 +1,3 @@
+// Optional: simulator builds do not require local signing configuration.
+#include? "../Signing.xcconfig"
+#include "../Version.xcconfig"

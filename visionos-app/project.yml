@@ -1,0 +1,38 @@
+name: TabletopCraft
+options:
+  preGenCommand: "printf 'MARKETING_VERSION = %s\\n' \"$(cat ../VERSION)\" > Version.xcconfig"
+  deploymentTarget:
+    visionOS: "27.0"
+packages:
+  TabletopCraft:
+    path: .
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  TabletopCraft:
+    type: application
+    platform: visionOS
+    sources: [App]
+    configFiles:
+      Debug: App/App.xcconfig
+      Release: App/App.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tabletopcraft.ar.visionos
+        PRODUCT_NAME: TabletopCraft
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - package: TabletopCraft
+        product: TabletopSpatial
+schemes:
+  TabletopCraft:
+    build:
+      targets:
+        TabletopCraft: all

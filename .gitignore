@@ -23,3 +23,14 @@ entity_models.json
 *.jks
 *.keystore
 upload.env
+
+# visionos-app
+visionos-app/.build/
+visionos-app/.swiftpm/
+visionos-app/DerivedData/
+visionos-app/build/
+visionos-app/*.xcodeproj/
+visionos-app/Signing.xcconfig
+visionos-app/Version.xcconfig
+visionos-app/**/xcuserdata/
+visionos-app/ROADMAP.md
