@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test on a Linux box: Paper 26.3 headless (offline mode, TEST ONLY) + plugin + fake Quest +
+# End-to-end test on a Linux box or a Mac (Homebrew bash 4+ and coreutils): Paper 26.3 headless (offline mode, TEST ONLY) + plugin + fake Quest +
 # mineflayer second player. Needs: JDK 25 on PATH (Paper 26.x and the plugin build both require Java 25), Node 18+,
 # Python 3.11+ with `pip install -r tools/requirements.txt`.
 # mineflayer only speaks up to 26.1, so the TEST server also gets ViaVersion + ViaBackwards (pinned, sha512-checked);
@@ -57,7 +57,9 @@ view-distance=6
 PROPS
 rm -f "$RUN/stdin.fifo"; mkfifo "$RUN/stdin.fifo"
 # --pid: the console feeder exits with this script, so cleanup never needs a pattern kill (which hit other servers).
-(cd "$RUN" && tail --pid=$$ -f stdin.fifo | java -Xmx2G -jar "$PAPER" --nogui > server.log 2>&1) &
+# GNU tail has --pid; on macOS use Homebrew coreutils' gtail.
+TAIL=tail; tail --pid=$$ -n 0 /dev/null >/dev/null 2>&1 || TAIL=gtail
+(cd "$RUN" && "$TAIL" --pid=$$ -f stdin.fifo | java -Xmx2G -jar "$PAPER" --nogui > server.log 2>&1) &
 SERVER=$!
 c() { echo "$*" > "$RUN/stdin.fifo"; sleep 0.5; }
 until grep -q "Done (" "$RUN/server.log" 2>/dev/null; do sleep 1; done
