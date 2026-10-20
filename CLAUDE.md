@@ -24,7 +24,6 @@ A Paper plugin streams a box of blocks, player positions and block changes over 
   - **Engine-free code:** tested under .NET 8 in `quest-app/Tests~` (`dotnet run -- --jar <client jar> --entity-models <json>`; `--live ws://host:8765/tabletop` for a live session).
   - **Next steps:** the roadmap is in docs/PLAN.md "Roadmap: playing Minecraft as a god".
 - **Repo hygiene:**
-  - Commit as `NickStassen <120063190+NickStassen@users.noreply.github.com>`. It's set repo-locally; the machine's global git email is a work address and must never reach this public repo, so check before pushing.
   - Nothing extracted from the Minecraft client jar is committed: textures, models and entity geometry are generated or loaded at runtime from the user's own files.
   - Unity batch runs kill the adb server, so run `adb start-server` afterwards.
 - Pins: Paper **26.3** (build 181) on **Java 25**, Gradle wrapper **9.8.0**, Shadow **9.6.1**, Java-WebSocket **1.6.0** (shaded to `dev.tabletopcraft.ar.libs.websocket`), Unity **6000.0.84f1**, Meta XR Core + MRUK **85.0.0** (same as ironman-quest3-hud). Don't bump to make errors go away.
