@@ -44,8 +44,8 @@ public struct SectionMesh: Sendable {
         }
         var solid: [Int] = [], cutout: [Int] = []
         for i in stride(from: 0,to: d.opaque.count,by: 3) where i+2 < d.opaque.count {
-            let tri = Array(d.opaque[i..<i+3]), layer = Int(verts[tri[0]].uv.z.rounded())
-            if solidPass && tri.allSatisfy({ verts[$0].color.a == 255 }) && (layer < 0 || solidLayers.contains(layer)) { solid.append(contentsOf: tri) }
+            let tri = Array(d.opaque[i..<i+3]), uvz = verts[tri[0]].uv.z
+            if solidPass && tri.allSatisfy({ verts[$0].color.a == 255 }) && SolidLayers.face(uvz,solidLayers) { solid.append(contentsOf: tri) }
             else { cutout.append(contentsOf: tri) }
         }
         return SectionMesh(verts: verts,indices: solid+cutout+d.transparent+d.waterBack,opaque: d.opaque.count,solid: solid.count,transparent: d.transparent.count,waterBack: d.waterBack.count,quads: verts.count/4-d.waterBack.count/6)

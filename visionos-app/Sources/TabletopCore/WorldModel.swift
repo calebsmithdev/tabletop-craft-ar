@@ -10,6 +10,20 @@ public struct WorldModel: Sendable {
     public var grid: [UInt16] = []
     public var light: [UInt8]?
     public var biomes: BiomeGrid?
+    public var shading = BlockShading()
+    public var tints: BiomeTints?
+    public private(set) var colormaps = BiomeColormaps()
+    public mutating func setColormaps(_ maps: BiomeColormaps) {
+        colormaps = maps
+        tints = biomes.map { BiomeTints($0,origin: origin,dims: dims,colormaps: maps) }
+    }
+    public var movingShown: [Int:String] = [:]
+    private var shapeOverrides: [String:BlockShape] = [:]
+    /// Called by the serial pack owner after prewarming. Worker copies never mutate shapes.
+    public mutating func applyShapeOverrides(_ overrides: [String:BlockShape]) {
+        shapeOverrides = overrides
+        shapes = palette.map { overrides[$0] ?? BlockRules.classify($0) }
+    }
     public var dirtySections: Set<SIMD3<Int>> = []
     public private(set) var paletteEpoch = 0
     public private(set) var edits = 0
@@ -29,20 +43,24 @@ public struct WorldModel: Sendable {
         snapshotId = s.snapshotId; world = s.world; origin = s.origin; dims = s.dims
         if !s.palette.starts(with: palette) { paletteEpoch += 1 }
         palette = s.palette; grid = s.grid; light = s.light; biomes = s.biomes
-        shapes = palette.map(BlockRules.shape)
+        shapes = palette.map { shapeOverrides[$0] ?? BlockRules.shape($0) }; movingShown = [:]
+        tints = biomes.map { BiomeTints($0,origin: origin,dims: dims,colormaps: colormaps) }
         dirtySections = Set(SectionPlan.keys(sectionCount))
     }
     @discardableResult public mutating func apply(_ message: JSONObject) -> Bool { applyBlockUpdate(message) }
     @discardableResult public mutating func applyBlockUpdate(_ m: JSONObject) -> Bool {
         guard m.i("snapshot_id", -2) == snapshotId else { return false }
         if let add = m.a("palette_add") {
-            for case let .string(s) in add { palette.append(s); shapes.append(BlockRules.shape(s)) }
+            for case let .string(s) in add { palette.append(s); shapes.append(shapeOverrides[s] ?? BlockRules.shape(s)) }
         }
+        var ghosts = PistonGhosts.begin(self)
         for value in m.a("changes") ?? [] {
             guard case let .array(a) = value, let c = try? SnapshotFields.ints(a), c.count == 4,
                   inBounds(c[0],c[1],c[2]), c[3] >= 0, c[3] < palette.count, c[3] < 65536 else { continue }
-            grid[index(c[0],c[1],c[2])] = UInt16(c[3]); markDirty(c[0],c[1],c[2])
+            let i = index(c[0],c[1],c[2]); ghosts?.record(i,grid[i])
+            grid[i] = UInt16(c[3]); markDirty(c[0],c[1],c[2])
         }
+        ghosts?.apply(&self)
         if light != nil {
             for value in m.a("light") ?? [] {
                 guard case let .array(a) = value, let c = try? SnapshotFields.ints(a), c.count == 4,
@@ -56,7 +74,7 @@ public struct WorldModel: Sendable {
     }
     public mutating func setLocal(_ x: Int, _ y: Int, _ z: Int, _ id: UInt16) {
         guard inBounds(x,y,z), Int(id) < palette.count else { return }
-        grid[index(x,y,z)] = id; markDirty(x,y,z)
+        grid[index(x,y,z)] = id; movingShown.removeValue(forKey: index(x,y,z)); markDirty(x,y,z)
     }
     mutating func markDirty(_ x: Int, _ y: Int, _ z: Int) {
         edits += 1

@@ -16,7 +16,7 @@ enum CLIError: Error, CustomStringConvertible {
 struct TabletopCLI {
     static let usage = """
     tabletop-cli --fixture <message.json>
-    tabletop-cli --mesh <snapshot.json> [--hash]
+    tabletop-cli --mesh <snapshot.json> [--jar <jar>] [--hash] [--flat-light | --no-light] [--reference-profile] [--reps N]
     tabletop-cli --live ws://HOST:8765/tabletop [--token T] [--seconds N]
 
     Delta fixtures load their base from chunk_snapshot_sections.json beside the input.
@@ -50,10 +50,25 @@ struct TabletopCLI {
                 print(String(format: "decode_ms=%.3f", milliseconds(since: start)))
             }
         case "--mesh":
-            guard args.count == 2 || (args.count == 3 && args[2] == "--hash") else {
-                throw CLIError.usage(usage)
+            var jar: String?, dump: String?, hash = false, flatLight = false, noLight = false, reference = false, reps = 1
+            var index = 2
+            while index < args.count {
+                switch args[index] {
+                case "--hash": hash = true
+                case "--flat-light": flatLight = true
+                case "--no-light": noLight = true
+                case "--reference-profile": reference = true
+                case "--jar", "--dump", "--reps":
+                    guard index+1 < args.count else { throw CLIError.usage(usage) }
+                    let option = args[index]; index += 1
+                    if option == "--jar" { jar = args[index] }
+                    else if option == "--dump" { dump = args[index] }
+                    else { guard let value = Int(args[index]), (1...1000).contains(value) else { throw CLIError.usage("--reps must be 1...1000") }; reps = value }
+                default: throw CLIError.usage(usage)
+                }
+                index += 1
             }
-            try mesh(URL(fileURLWithPath: args[1]), hash: args.contains("--hash"))
+            try mesh(URL(fileURLWithPath: args[1]),hash: hash,jar: jar,flatLight: flatLight,noLight: noLight,referenceProfile: reference,reps: reps,dump: dump)
         case "--live":
             var token = ""
             var seconds = 10.0
@@ -158,40 +173,73 @@ struct TabletopCLI {
         }
     }
 
-    static func mesh(_ url: URL, hash: Bool) throws {
+    static func mesh(_ url: URL, hash: Bool, jar: String?, flatLight: Bool, noLight: Bool, referenceProfile: Bool, reps: Int, dump: String?) throws {
         let decodeStart = ContinuousClock.now
         let snapshot = try loadSnapshot(url)
         let decodeMs = milliseconds(since: decodeStart)
         summarize(snapshot)
-        var world = WorldModel()
-        world.applySnapshot(snapshot)
+        var world = WorldModel(); world.applySnapshot(snapshot)
+        if noLight { world.light = nil; world.biomes = nil; world.tints = nil }
+        world.shading = BlockShading(smoothLighting: !flatLight)
+        var faces: any IFaceSource = FlatFaceSource()
+        var solidLayers: Set<Int> = []
+        if let jar {
+            let loadStart = ContinuousClock.now
+            let atlas = try ResourcePackAtlas(path: jar,referenceProfile: referenceProfile)
+            let loadMs = milliseconds(since: loadStart), bakeStart = ContinuousClock.now
+            atlas.prewarm(world.palette)
+            if referenceProfile {
+                _ = atlas.face(FluidRules.waterState,0); _ = atlas.face(FluidRules.lavaState,0)
+                // The C# profile resolves these lazily in the untimed warm-up. They have no baked
+                // geometry in PackFaces; resolve before publishing our immutable worker snapshot.
+                _ = atlas.face(FluidRules.waterFlowState,4); _ = atlas.face(FluidRules.lavaFlowState,4)
+                _ = atlas.face(FluidRules.overlayState,4)
+            }
+            let pack = atlas.baked(), bakeMs = milliseconds(since: bakeStart)
+            world.applyShapeOverrides(pack.shapeOverrides)
+            if !noLight { world.setColormaps(pack.colormaps) }
+            faces = pack; solidLayers = pack.solidLayers
+            print(String(format: "pack_load_ms=%.3f pack_bake_ms=%.3f layers=%d animations=%d tile=%d reference_profile=%@",loadMs,bakeMs,pack.layers.count,pack.animations.count,pack.tileSize,referenceProfile ? "yes" : "no"))
+        }
         let n = world.sectionCount
-        var meshMs = 0.0
-        var vertices = 0
-        var faces = 0
+        let sections = (0..<n.x).flatMap { x in (0..<n.y).flatMap { y in (0..<n.z).map { Int3(x,y,$0) } } }
+        // Like the C# runner, measure after one untimed pass.
+        for section in sections {
+            var data = MeshData(); GreedyMesher.build(world,section,faces,&data)
+            GreedyMesher.buildSpecials(world,section,faces,&data)
+            _ = SectionMesh.from(data,section,solidLayers: solidLayers)
+        }
+        if let dump { try FileManager.default.createDirectory(atPath: dump,withIntermediateDirectories: true) }
+        var meshMs = 0.0, fromMs = 0.0, vertices = 0, quads = 0
         var meshes: [MeshData] = []
-        for x in 0..<n.x {
-            for y in 0..<n.y {
-                for z in 0..<n.z {
-                    let section = Int3(x, y, z)
-                    var data = MeshData()
-                    let start = ContinuousClock.now
-                    GreedyMesher.build(world, section, &data)
-                    GreedyMesher.buildSpecials(world, section, &data)
-                    meshMs += milliseconds(since: start)
-                    vertices += data.verts.count
-                    faces += data.verts.count / 4
-                    print("section=\(x),\(y),\(z) faces=\(data.verts.count / 4) vertices=\(data.verts.count)")
-                    if hash {
-                        print("section_hash_exact=\(MeshHash.exact(data))")
-                        meshes.append(data)
-                    }
+        for repetition in 0..<reps {
+            for section in sections {
+                var data = MeshData(); let start = ContinuousClock.now
+                GreedyMesher.build(world,section,faces,&data)
+                GreedyMesher.buildSpecials(world,section,faces,&data)
+                meshMs += milliseconds(since: start)
+                let fromStart = ContinuousClock.now
+                let sectionMesh = SectionMesh.from(data,section,solidLayers: solidLayers)
+                fromMs += milliseconds(since: fromStart)
+                if repetition == 0 {
+                    vertices += data.verts.count; quads += sectionMesh?.quads ?? 0
+                    print("section=\(section.x),\(section.y),\(section.z) faces=\(sectionMesh?.quads ?? 0) vertices=\(data.verts.count)")
+                    if hash { print("section_hash_exact=\(MeshHash.exact(data))"); meshes.append(data) }
+                    if let dump { try dumpMesh(data,to: URL(fileURLWithPath: dump).appendingPathComponent("\(section.x)-\(section.y)-\(section.z).json")) }
                 }
             }
         }
-        print(String(format: "sections=%d faces=%d vertices=%d decode_ms=%.3f mesh_ms=%.3f",
-                     n.x * n.y * n.z, faces, vertices, decodeMs, meshMs))
+        let count = max(1,sections.count*reps)
+        print(String(format: "sections=%d faces=%d vertices=%d decode_ms=%.3f mesh_ms=%.3f from_ms=%.3f mesh_ms_per_section=%.3f total_ms_per_section=%.3f reps=%d",sections.count,quads,vertices,decodeMs,meshMs/Double(reps),fromMs/Double(reps),meshMs/Double(count),(meshMs+fromMs)/Double(count),reps))
         if hash { print("canonical_quad_hash=\(MeshHash.canonical(meshes))") }
+    }
+
+    static func dumpMesh(_ mesh: MeshData, to url: URL) throws {
+        func bits(_ vectors: [SIMD3<Float>]) -> [[Int32]] {
+            vectors.map { [Int32(bitPattern: $0.x.bitPattern),Int32(bitPattern: $0.y.bitPattern),Int32(bitPattern: $0.z.bitPattern)] }
+        }
+        let value: [String:Any] = ["verts":bits(mesh.verts),"uvs":bits(mesh.uvs),"colors":mesh.colors.map { [Int($0.r),Int($0.g),Int($0.b),Int($0.a)] },"opaque":mesh.opaque,"transparent":mesh.transparent,"waterBack":mesh.waterBack,"light":mesh.light.map(Int.init)]
+        try JSONSerialization.data(withJSONObject: value,options: [.sortedKeys]).write(to: url)
     }
 
     static func live(_ url: String, token: String, seconds: Double) async throws {

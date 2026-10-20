@@ -15,15 +15,17 @@ public struct BatchUpload: Sendable {
     public let position: SIMD3<Float>
     public let blockSize: Float
     public let center: SIMD3<Float>
+    public let cellOrigin: SIMD3<Int>
 
     public init(generation: UInt64, key: SIMD3<Int>, data: BatchData,
-                position: SIMD3<Float>, blockSize: Float, center: SIMD3<Float>) {
+                position: SIMD3<Float>, blockSize: Float, center: SIMD3<Float>, cellOrigin: SIMD3<Int> = .zero) {
         self.generation = generation
         self.key = key
         self.data = data
         self.position = position
         self.blockSize = blockSize
         self.center = center
+        self.cellOrigin = cellOrigin
     }
 }
 
@@ -47,6 +49,13 @@ public final class BatchScene: Sendable {
         var generation: UInt64 = 0
         var visibleGeneration: UInt64 = 0
         var visibleGPU: [SIMD3<Int>: PreparedBatch] = [:]
+        var packSource: BakedResourcePack?
+        var pack: PreparedPack?
+        var visiblePack: PreparedPack?
+        var packRevision: UInt64 = 0
+        var packReady = true
+        var preparationError: String?
+        var mipmaps = true
         var staging = false
         var completionRequested = false
         var revision: UInt64 = 0
@@ -77,6 +86,7 @@ public final class BatchScene: Sendable {
             state.generation = generation
             state.visibleGeneration = generation
             state.visibleGPU.removeAll()
+            state.visiblePack = state.packReady ? state.pack : nil
             state.staging = false
             state.completionRequested = false
             state.cpu.removeAll()
@@ -84,23 +94,76 @@ public final class BatchScene: Sendable {
             state.gpu.removeAll()
             state.failed.removeAll()
             state.consumers.removeAll { $0.value == nil }
-            for consumer in state.consumers { consumer.value?.reset(generation: generation) }
+            for consumer in state.consumers { consumer.value?.reset(generation: generation, pack: state.visiblePack) }
         }
     }
 
     /// Stage replacements while visible content remains drawn; empty scenes load progressively.
     public func beginGeneration(_ generation: UInt64) {
-        state.withLock { state in
-            guard generation > state.generation else { return }
+        beginGeneration(generation, replacingPack: false, pack: nil)
+    }
+
+    /// nil explicitly selects the flat fallback. The old atlas stays with old
+    /// staged meshes until all replacements and the new GPU atlas are ready.
+    public func beginGeneration(_ generation: UInt64, pack: BakedResourcePack?) {
+        beginGeneration(generation, replacingPack: true, pack: pack)
+    }
+
+    /// Append layers from the session-owned atlas without changing the mesh generation.
+    /// Call before publishing geometry that references the new palette. Existing
+    /// draws remain visible until preparation finishes, including capacity growth.
+    public func updatePack(_ pack: BakedResourcePack, generation: UInt64) {
+        let schedule = state.withLock { state in
+            guard generation == state.generation else { return false }
+            state.packRevision &+= 1
+            state.packSource = pack
+            state.packReady = false
+            state.preparationError = nil
+            guard state.device != nil, !state.scheduled else { return false }
+            state.scheduled = true
+            return true
+        }
+        if schedule { worker.async { self.preparePending() } }
+    }
+
+    /// Latest pack preparation failure. A failed pack publishes flat fallback
+    /// meshes and resolves readiness instead of pinning the previous generation.
+    public var preparationError: String? { state.withLock { $0.preparationError } }
+
+    /// True until the latest CPU pack has either uploaded or selected fallback.
+    /// The session uses this to keep interrupted-load recovery active through GPU preparation.
+    public var packPreparationPending: Bool { state.withLock { !$0.packReady } }
+
+    // Diagnostic seam: a device-less scene retains only the source awaiting upload.
+    var retainsPackSource: Bool { state.withLock { $0.packSource != nil } }
+
+    public func setMipmaps(_ enabled: Bool) {
+        state.withLock { $0.mipmaps = enabled }
+    }
+
+    func mipmapsIfAvailable() -> Bool? { state.withLockIfAvailable { $0.mipmaps } }
+
+    private func beginGeneration(_ generation: UInt64, replacingPack: Bool, pack: BakedResourcePack?) {
+        let schedule = state.withLock { state in
+            guard generation > state.generation else { return false }
             state.generation = generation
             state.cpu = [:]; state.pending = [:]; state.gpu = [:]; state.failed = [:]
             state.staging = !state.visibleGPU.isEmpty
-            if !state.staging {
-                state.visibleGeneration = generation
-                for consumer in state.consumers { consumer.value?.reset(generation: generation) }
+            if replacingPack {
+                state.packRevision &+= 1
+                state.packSource = pack; state.pack = nil; state.packReady = pack == nil
+                state.preparationError = nil
+            }
+            if !state.staging && state.packReady {
+                state.visibleGeneration = generation; state.visiblePack = state.pack
+                for consumer in state.consumers { consumer.value?.reset(generation: generation, pack: state.pack) }
             }
             state.completionRequested = false
+            guard !state.packReady, state.device != nil, !state.scheduled else { return false }
+            state.scheduled = true
+            return true
         }
+        if schedule { worker.async { self.preparePending() } }
     }
 
     /// Meshing is complete. Publication waits for every latest revision to be prepared.
@@ -123,16 +186,17 @@ public final class BatchScene: Sendable {
 
     private static func commitIfReady(_ state: inout State) {
         guard state.staging, state.completionRequested else { return }
-        guard state.device != nil else { return }
+        guard state.device != nil, state.packReady else { return }
         guard state.pending.isEmpty, state.cpu.allSatisfy({
             state.gpu[$0.key]?.revision == $0.value.revision || state.failed[$0.key] == $0.value.revision
         }) else { return }
         state.visibleGeneration = state.generation
         state.visibleGPU = state.gpu
+        state.visiblePack = state.pack
         state.staging = false
         state.consumers.removeAll { $0.value == nil }
         for consumer in state.consumers {
-            consumer.value?.reset(generation: state.generation, batches: state.gpu)
+            consumer.value?.reset(generation: state.generation, batches: state.gpu, pack: state.pack)
         }
     }
 
@@ -150,7 +214,7 @@ public final class BatchScene: Sendable {
                 state.pending.removeAll()
                 state.gpu.removeAll()
                 state.failed.removeAll()
-                for consumer in state.consumers { consumer.value?.reset(generation: upload.generation) }
+                for consumer in state.consumers { consumer.value?.reset(generation: upload.generation, pack: state.pack) }
             }
             state.revision &+= 1
             let entry = Entry(revision: state.revision, upload: upload)
@@ -180,14 +244,14 @@ public final class BatchScene: Sendable {
                 throw BatchPreparationError.differentDevice
             }
             state.device = device
-            mailbox.reset(generation: state.visibleGeneration, batches: state.visibleGPU)
+            mailbox.reset(generation: state.visibleGeneration, batches: state.visibleGPU, pack: state.visiblePack)
             state.consumers.removeAll { $0.value == nil }
             state.consumers.append(WeakMailbox(value: mailbox))
             for (key, entry) in state.cpu where state.gpu[key]?.revision != entry.revision && state.failed[key] != entry.revision {
                 state.pending[key] = entry
             }
             Self.commitIfReady(&state)
-            guard !state.pending.isEmpty, !state.scheduled else { return false }
+            guard (!state.pending.isEmpty || !state.packReady), !state.scheduled else { return false }
             state.scheduled = true
             return true
         }
@@ -197,21 +261,59 @@ public final class BatchScene: Sendable {
 
     private func preparePending() {
         while true {
+            // Always resolve the latest pack before dequeuing more geometry.
+            // updatePack closes the publication gate synchronously, even when an
+            // earlier geometry/pack request is already running on this worker.
+            let packRequest = state.withLock { state -> (BakedResourcePack, UInt64, any MTLDevice, PreparedPack?)? in
+                guard !state.packReady, let source = state.packSource, let device = state.device else { return nil }
+                return (source, state.packRevision, device, state.pack)
+            }
+            if let (source, revision, device, previous) = packRequest {
+                let result = Result { try PreparedPack.prepare(source, device: device, extending: previous) }
+                state.withLock { state in
+                    guard state.packRevision == revision else { return }
+                    state.packSource = nil
+                    state.packReady = true
+                    switch result {
+                    case .success(let pack):
+                        state.pack = pack
+                        state.preparationError = nil
+                    case .failure(let error):
+                        state.pack = nil
+                        state.preparationError = String(describing: error)
+                        state.failures += 1
+                        log.error("PACK preparation failed: \(String(describing: error), privacy: .public)")
+                    }
+                    if state.staging {
+                        Self.commitIfReady(&state)
+                    } else {
+                        state.visibleGeneration = state.generation
+                        state.visiblePack = state.pack
+                        state.visibleGPU = state.gpu
+                        for c in state.consumers {
+                            c.value?.reset(generation: state.generation, batches: state.gpu, pack: state.pack)
+                        }
+                    }
+                }
+                continue
+            }
             let next: (Entry, any MTLDevice)? = state.withLock { state in
+                // A pack request can arrive between the two lock acquisitions.
+                guard state.packReady else { return nil }
                 if let device = state.device {
                     while let (key, entry) = state.pending.first {
                         state.pending.removeValue(forKey: key)
-                        // Attachment can requeue an in-flight revision. Resolve it once.
                         if state.gpu[key]?.revision != entry.revision && state.failed[key] != entry.revision {
                             return (entry, device)
                         }
                     }
                 }
-                // Skipping an attachment's duplicate may remove the last readiness blocker.
                 Self.commitIfReady(&state)
                 state.scheduled = false
                 return nil
             }
+            // If updatePack raced the dequeue, keep this scheduled worker alive.
+            if next == nil, state.withLock({ !$0.packReady && $0.packSource != nil && $0.device != nil }) { continue }
             guard let (entry, device) = next else { return }
             autoreleasepool {
                 let result = Result { try PreparedBatch.prepare(entry.upload, revision: entry.revision, device: device) }
@@ -225,7 +327,7 @@ public final class BatchScene: Sendable {
                         state.consumers.removeAll { $0.value == nil }
                         if state.staging {
                             Self.commitIfReady(&state)
-                        } else {
+                        } else if state.packReady {
                             state.visibleGPU[entry.upload.key] = prepared
                             for consumer in state.consumers { consumer.value?.publish(prepared) }
                         }
@@ -246,6 +348,10 @@ public final class BatchScene: Sendable {
     /// Release replaced meshes away from the render thread, including reset dictionaries.
     func retire(_ batches: [SIMD3<Int>: PreparedBatch]) {
         worker.async { withExtendedLifetime(batches) {} }
+    }
+
+    func retire(_ drawing: PreparedDrawScene) {
+        worker.async { withExtendedLifetime(drawing) {} }
     }
 
     func retire(_ batches: [PreparedBatch]) {
@@ -271,65 +377,40 @@ struct PreparedBatch: @unchecked Sendable {
     let boundsMin: SIMD3<Float>
     let boundsMax: SIMD3<Float>
 
-    // Two float4s, 32-byte stride; this deliberately does not upload BatchVertex's ABI.
-    private struct Vertex {
-        var position: SIMD4<Float>
-        var color: SIMD4<Float>
-    }
+    let packed: Bool
+    let ranges: BatchRanges
+    let transform: SIMD4<Float> // translation in table metres, block size in w
+    let cellOrigin: SIMD4<Int32>
 
     static func prepare(_ upload: BatchUpload, revision: UInt64, device: any MTLDevice) throws -> Self {
         let data = upload.data
+        let ranges = try BatchRanges(data)
         guard upload.blockSize.isFinite, upload.blockSize > 0,
               upload.position.allFinite, upload.center.allFinite,
               data.min.allFinite, data.max.allFinite,
-              data.indices.count.isMultiple(of: 3), data.waterBack >= 0,
-              data.waterBack <= data.indices.count else { throw BatchPreparationError.invalidGeometry }
-        let count = data.indices.count - data.waterBack
-        guard count.isMultiple(of: 3) else { throw BatchPreparationError.invalidGeometry }
-        let a = (data.min + upload.position - upload.center) * upload.blockSize
-        let b = (data.max + upload.position - upload.center) * upload.blockSize
-        if data.verts.isEmpty || count == 0 {
-            return Self(generation: upload.generation, revision: revision, key: upload.key,
-                        vertices: nil, indices: nil, indexCount: 0, boundsMin: a, boundsMax: b)
+              data.verts.count <= Int(UInt32.max),
+              data.indices.allSatisfy({ $0 >= 0 && $0 < data.verts.count }),
+              upload.cellOrigin.x >= Int(Int32.min), upload.cellOrigin.x <= Int(Int32.max),
+              upload.cellOrigin.y >= Int(Int32.min), upload.cellOrigin.y <= Int(Int32.max),
+              upload.cellOrigin.z >= Int(Int32.min), upload.cellOrigin.z <= Int(Int32.max),
+              data.verts.allSatisfy({ $0.pos.allFinite && $0.uv.allFinite }) else { throw BatchPreparationError.invalidGeometry }
+        let translation = (upload.position - upload.center) * upload.blockSize
+        let a = data.min * upload.blockSize + translation, b = data.max * upload.blockSize + translation
+        let packedBytes = data.packedBytes()
+        let bytes = packedBytes ?? BatchEncoding.classicBytes(data.verts)
+        var vb: (any MTLBuffer)?, ib: (any MTLBuffer)?
+        if !data.indices.isEmpty {
+            let indices = data.indices.map { UInt32($0) }
+            vb = bytes.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+            ib = indices.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+            guard vb != nil, ib != nil else { throw BatchPreparationError.resourceAllocation }
         }
-        guard data.verts.count <= Int(UInt32.max),
-              data.indices.allSatisfy({ $0 >= 0 && $0 < data.verts.count }) else {
-            throw BatchPreparationError.invalidGeometry
-        }
-        // Double-sided specials can have cancelling accumulated normals. Recover
-        // their first geometric normal for shading without changing any indices.
-        var normals = data.verts.map { SIMD3<Float>(Float($0.nx), Float($0.ny), Float($0.nz)) }
-        for i in stride(from: 0, to: count, by: 3) {
-            let ia = data.indices[i], ib = data.indices[i + 1], ic = data.indices[i + 2]
-            let n = simd_cross(data.verts[ib].pos - data.verts[ia].pos,
-                               data.verts[ic].pos - data.verts[ia].pos)
-            for index in [ia, ib, ic] where normals[index] == .zero { normals[index] = n }
-        }
-        var vertices: [Vertex] = []
-        vertices.reserveCapacity(data.verts.count)
-        for (i, vertex) in data.verts.enumerated() {
-            let position = (vertex.pos + upload.position - upload.center) * upload.blockSize
-            guard position.allFinite else { throw BatchPreparationError.invalidGeometry }
-            let n = normals[i], absolute = simd_abs(n)
-            let shade: Float
-            if absolute.y >= absolute.x && absolute.y >= absolute.z { shade = n.y >= 0 ? 1 : 0.5 }
-            else if absolute.z >= absolute.x { shade = 0.8 }
-            else { shade = 0.6 }
-            let color = vertex.color
-            // M1b is the flat opaque-colour milestone; no texture/alpha material passes yet.
-            vertices.append(Vertex(position: SIMD4(position, 1), color: SIMD4(
-                Float(color.r) / 255 * shade, Float(color.g) / 255 * shade, Float(color.b) / 255 * shade, 1)))
-        }
-        let indices = data.indices.prefix(count).map { UInt32($0) }
-        guard let vb = vertices.withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }),
-              let ib = indices.withUnsafeBytes({ device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }) else {
-            throw BatchPreparationError.resourceAllocation
-        }
-        vb.label = "Tabletop batch vertices"
-        ib.label = "Tabletop batch indices"
         return Self(generation: upload.generation, revision: revision, key: upload.key,
-                    vertices: vb, indices: ib, indexCount: count, boundsMin: a, boundsMax: b)
+                    vertices: vb, indices: ib, indexCount: data.indices.count, boundsMin: a, boundsMax: b,
+                    packed: packedBytes != nil, ranges: ranges, transform: SIMD4(translation, upload.blockSize),
+                    cellOrigin: SIMD4(Int32(upload.cellOrigin.x), Int32(upload.cellOrigin.y), Int32(upload.cellOrigin.z), 0))
     }
+
 }
 
 private extension SIMD3 where Scalar == Float {
@@ -344,20 +425,31 @@ final class BatchMailbox: Sendable {
     private struct State: Sendable {
         var generation: UInt64 = 0
         var batches: [SIMD3<Int>: PreparedBatch] = [:]
+        var retained: [SIMD3<Int>: PreparedBatch] = [:]
+        var pack: PreparedPack?
+        var render: PreparedDrawScene?
     }
     private let state = Mutex(State())
 
-    func reset(generation: UInt64, batches: [SIMD3<Int>: PreparedBatch] = [:]) {
+    func reset(generation: UInt64, batches: [SIMD3<Int>: PreparedBatch] = [:], pack: PreparedPack? = nil) {
         // Give this mailbox unique dictionary storage. A COW snapshot of the GPU
         // cache would otherwise copy all entries on the first render-thread pop.
-        state.withLock { $0 = State(generation: generation, batches: batches.mapValues { $0 }) }
+        state.withLock { $0 = State(generation: generation, batches: batches.mapValues { $0 }, retained: batches, pack: pack, render: PreparedDrawScene(generation: generation, batches: batches, pack: pack)) }
     }
     func publish(_ batch: PreparedBatch) {
         state.withLock { state in
             guard batch.generation == state.generation else { return }
             state.batches[batch.key] = batch
+            state.retained[batch.key] = batch
+            state.render = PreparedDrawScene(generation: state.generation, batches: state.retained, pack: state.pack)
         }
     }
+    func takeRenderScene() -> PreparedDrawScene? {
+        state.withLockIfAvailable { state in
+            let next = state.render; state.render = nil; return next
+        } ?? nil
+    }
+
     func next(generation: UInt64?) -> Update? {
         // Never wait behind a producer on the real-time render path.
         state.withLockIfAvailable { state -> Update? in

@@ -260,7 +260,7 @@ def receive():
     return a&15,d
 op,data=receive(); hello=json.loads(data)
 assert op==1 and hello['type']=='hello' and hello['seq']==0 and hello['v']==1 and hello['client']=='visionos-app',hello
-assert hello['caps']==['rle_palette_v1','avatar','light_v1','biomes_v1','sections_v1','pair_v1']
+assert hello['caps']==['rle_palette_v1','avatar','light_v1','biomes_v1','sections_v1','pair_v1','assets_v1']
 result={'hello':True,'hellos':1,'server_pong':False,'client_ping':False,'bye':False}
 if mode=='reconnect':
     send({'v':1,'type':'welcome','seq':0,'t':0,'protocol':1,'world':'world','region':{'origin':[0,0,0],'dims':[2,1,1]}})

@@ -6,8 +6,8 @@ public enum Protocol {
     public static let version = 1
     public static let clientName = "visionos-app"
     public static let clientVersion = "1.0.0"
-    /// M1 stream, poses, snapshot extras, sections and pairing; no later feature capabilities.
-    public static let capabilities = ["rle_palette_v1", "avatar", "light_v1", "biomes_v1", "sections_v1", "pair_v1"]
+    /// Stream, snapshot extras, pairing and trusted-LAN asset delivery.
+    public static let capabilities = ["rle_palette_v1", "avatar", "light_v1", "biomes_v1", "sections_v1", "pair_v1", "assets_v1"]
     public static let capLight = "light_v1", capBiomes = "biomes_v1"
     public static let capEdit = "edit_v1", capEntities = "entities_v1", capActions = "actions_v1"
     public static let capBlockEntities = "block_entities_v1", capWorld = "world_v1", capSound = "sound_v1"
@@ -260,8 +260,10 @@ public struct BlockUpdate: Sendable {
     public static func from(_ m: JSONObject) throws -> Self {
         func changes(_ key: String) throws -> [Change] {
             try (m.a(key) ?? []).map {
-                let a = try Json.ints($0.arrayValue)
-                guard a.count == 4, a.allSatisfy({ $0 >= 0 }) else { throw JsonError("bad \(key)") }
+                guard let values = $0.arrayValue else { throw JsonError("bad \(key)") }
+                let a = try SnapshotFields.ints(values)
+                guard a.count == 4, a.allSatisfy({ $0 >= 0 }),
+                      a.prefix(3).allSatisfy({ $0 <= SnapshotLimits.maxCoordinate }) else { throw JsonError("bad \(key)") }
                 return Change(pos: Int3(a[0], a[1], a[2]), value: a[3])
             }
         }
@@ -300,7 +302,7 @@ public struct AvatarState: Sendable {
 
 private func float3(_ m: JSONObject, _ key: String) throws -> Float3 {
     let a = try Json.doubles(m.a(key))
-    guard a.count == 3, a.allSatisfy({ $0.isFinite && abs($0) <= Double(Float.greatestFiniteMagnitude) }) else { throw JsonError("bad \(key)") }
+    guard a.count == 3, a.allSatisfy({ $0.isFinite && abs($0) <= Double(SnapshotLimits.maxCoordinate) }) else { throw JsonError("bad \(key)") }
     return Float3(Float(a[0]), Float(a[1]), Float(a[2]))
 }
 private func reference(_ m: JSONObject) -> UInt32? { m["ref_seq"]?.numberValue.flatMap(UInt32.init(exactly:)) }

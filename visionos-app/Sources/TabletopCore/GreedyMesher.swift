@@ -1,5 +1,5 @@
 // Port of quest-app/Assets/Scripts/World/GreedyMesher.cs at f0583fd.
-// M1 flat-colour path; pack models, fluids and biome/light shading are M3.
+// CPU textured path. Coordinates and winding remain in the tabletop frame.
 public enum TintKind: UInt8, Sendable { case none, grass, foliage, dryFoliage, water }
 public struct FaceKey: Equatable, Sendable {
     public var layer = 0
@@ -44,6 +44,13 @@ public struct MeshData: Sendable {
     public var waterBack: [Int] = []
     public var light: [UInt8] = []
     public init() {}
+    public mutating func addColors(_ q: Quad4) {
+        colors.append(contentsOf: [q.c0,q.c1,q.c2,q.c3])
+        light.append(contentsOf: [q.l0,q.l1,q.l2,q.l3])
+    }
+    public mutating func copyColor(_ i: Int) {
+        colors.append(colors[i]); light.append(i < light.count ? light[i] : 240)
+    }
     public mutating func clear() {
         verts.removeAll(keepingCapacity: true); uvs.removeAll(keepingCapacity: true); colors.removeAll(keepingCapacity: true)
         opaque.removeAll(keepingCapacity: true); transparent.removeAll(keepingCapacity: true); waterBack.removeAll(keepingCapacity: true); light.removeAll(keepingCapacity: true)
@@ -72,6 +79,8 @@ public enum GreedyMesher {
         var keyCache: [Int: FaceKey] = [:]
         let leaves = w.palette.map { BlockRules.path($0).hasSuffix("_leaves") }
         var mask = ContiguousArray<FaceKey?>(repeating: nil,count: 256)
+        var colors = [Quad4?](repeating: nil,count: 256)
+        var overlays = [Quad4?](repeating: nil,count: 256)
         let strides = [1,p*p,p]
         for dir in 0..<6 {
             let axis = dir/2, ua = (axis+1)%3, va = (axis+2)%3
@@ -92,17 +101,27 @@ public enum GreedyMesher {
                     if let cached = keyCache[cacheId] { key = cached }
                     else { key = faces.face(w.state(id),dir); keyCache[cacheId] = key }
                     key.transparent = key.transparent || shape != .cube; mask[k] = key
+                    var c = SIMD3<Int>.zero; c[axis] = d; c[ua] = u; c[va] = v; c &+= b0
+                    colors[k] = BlockShading.faceCorners(w,key,c.x,c.y,c.z,dir)
+                    overlays[k] = key.overlay == 0 ? nil : BlockShading.faceCorners(w,key.overlayKey(),c.x,c.y,c.z,dir)
                 } }
                 for v in 0..<size[va] {
                     var u = 0
                     while u < size[ua] {
                         let k = u+v*16
                         guard let key = mask[k] else { u += 1; continue }
+                        let col = colors[k]!, over = overlays[k]
                         var width = 1
-                        while u+width < size[ua] && mask[k+width] == key { width += 1 }
-                        var height = 1, ok = true
+                        if col.same(0,1) && col.same(3,2) && (over == nil || (over!.same(0,1) && over!.same(3,2))) {
+                            while u+width < size[ua] && mask[k+width] == key && colors[k+width] == col && overlays[k+width] == over { width += 1 }
+                        }
+                        var height = 1
+                        var ok = col.same(0,3) && col.same(1,2) && (over == nil || (over!.same(0,3) && over!.same(1,2)))
                         while v+height < size[va] && ok {
-                            for i in 0..<width where mask[u+i+(v+height)*16] != key { ok = false; break }
+                            for i in 0..<width {
+                                let j = u+i+(v+height)*16
+                                if mask[j] != key || colors[j] != col || overlays[j] != over { ok = false; break }
+                            }
                             if ok { height += 1 }
                         }
                         var corners: [SIMD3<Float>] = []
@@ -110,8 +129,10 @@ public enum GreedyMesher {
                             var c = SIMD3<Float>(Float(b0.x),Float(b0.y),Float(b0.z))
                             c[axis] += Float(d + (dir & 1 == 1 ? 1 : 0)); c[ua] += Float(cu); c[va] += Float(cv); corners.append(c)
                         }
-                        emit(&m,corners,key,dir & 1 == 1,false,dir,b0)
-                        if key.overlay != 0 { emit(&m,corners,key.overlayKey(),dir & 1 == 1,false,dir,b0) }
+                        func luma(_ c: Color32) -> Int { Int(c.r)*2+Int(c.g)*5+Int(c.b) }
+                        let flip = luma(col.c1)+luma(col.c3) > luma(col.c0)+luma(col.c2)
+                        emit(&m,corners,key,dir & 1 == 1,false,dir,b0,col,flip)
+                        if let over { emit(&m,corners,key.overlayKey(),dir & 1 == 1,false,dir,b0,over,flip) }
                         for j in 0..<height { for i in 0..<width { mask[u+i+(v+j)*16] = nil } }
                         u += width
                     }
@@ -119,8 +140,12 @@ public enum GreedyMesher {
             }
         }
     }
-    public static func build(_ w: WorldModel, _ section: SIMD3<Int>, _ m: inout MeshData) { build(w,section,FlatFaceSource(),&m) }
-    public static func buildSpecials(_ w: WorldModel, _ section: SIMD3<Int>, _ faces: any IFaceSource, _ m: inout MeshData) {
+    /// M1 app compatibility. The explicit face-source overload opts into M3 lighting.
+    public static func build(_ w: WorldModel, _ section: SIMD3<Int>, _ m: inout MeshData) {
+        var flat = w; flat.light = nil; flat.tints = nil
+        build(flat,section,FlatFaceSource(),&m)
+    }
+    public static func buildSpecials(_ w: WorldModel, _ section: SIMD3<Int>, _ faces: any IFaceSource, _ m: inout MeshData, includeFluids: Bool = true) {
         let b = section &* SIMD3(repeating: 16)
         guard b.x >= 0, b.y >= 0, b.z >= 0, b.x < w.dims.x, b.y < w.dims.y, b.z < w.dims.z else { return }
         for y in b.y..<min(b.y+16,w.dims.y) { for z in b.z..<min(b.z+16,w.dims.z) { for x in b.x..<min(b.x+16,w.dims.x) {
@@ -128,8 +153,9 @@ public enum GreedyMesher {
             if shape == .cross {
                 var k = faces.face(w.state(id),4); k.transparent = true
                 let a = SIMD3<Float>(Float(x),Float(y),Float(z))
-                emit(&m,[a,a+SIMD3(1,0,1),a+SIMD3(1,1,1),a+SIMD3(0,1,0)],k,true,true)
-                emit(&m,[a+SIMD3(1,0,0),a+SIMD3(0,0,1),a+SIMD3(0,1,1),a+SIMD3(1,1,0)],k,true,true)
+                let (color,code) = BlockShading.flat(w,k,SIMD3(x,y,z)), col = Quad4(color,code)
+                emit(&m,[a,a+SIMD3(1,0,1),a+SIMD3(1,1,1),a+SIMD3(0,1,0)],k,true,true,nil,.zero,col)
+                emit(&m,[a+SIMD3(1,0,0),a+SIMD3(0,0,1),a+SIMD3(0,1,1),a+SIMD3(1,1,0)],k,true,true,nil,.zero,col)
             } else if shape == .slab {
                 let st = w.state(id), a = SIMD3<Float>(Float(x),Float(y)+(st.contains("type=top") ? 0.5 : 0),Float(z)), b = a+SIMD3(1,0.5,1)
                 let corners: [[SIMD3<Float>]] = [
@@ -139,11 +165,23 @@ public enum GreedyMesher {
                     [SIMD3(b.x,a.y,b.z),b,SIMD3(a.x,b.y,b.z),SIMD3(a.x,a.y,b.z)],
                     [SIMD3(a.x,a.y,b.z),SIMD3(a.x,b.y,b.z),SIMD3(a.x,b.y,a.z),a],
                     [SIMD3(b.x,a.y,a.z),SIMD3(b.x,b.y,a.z),b,SIMD3(b.x,a.y,b.z)]]
-                for (i,dir) in [3,2,4,5,0,1].enumerated() { emit(&m,corners[i],faces.face(st,dir),true,true) }
+                for (i,dir) in [3,2,4,5,0,1].enumerated() {
+                    let key = faces.face(st,dir), c = corners[i]
+                    let col = BlockShading.quad(w,key,SIMD3(x,y,z),dir,c[0],c[1],c[2],c[3])
+                    emit(&m,c,key,true,true,nil,.zero,col)
+                }
+            } else if shape == .model {
+                let st = w.movingShown[w.index(x,y,z)] ?? w.state(id), models = faces as? any IModelSource
+                BlockModelMesher.emit(&m,w,x,y,z,st,models?.model(st),models)
             }
         } } }
+        if includeFluids { FluidMesher.build(w,section,faces,&m) }
     }
-    public static func buildSpecials(_ w: WorldModel, _ section: SIMD3<Int>, _ m: inout MeshData) { buildSpecials(w,section,FlatFaceSource(),&m) }
+    /// M1's renderer has no fluid/transparent pipeline. Explicit faces opt into M3.
+    public static func buildSpecials(_ w: WorldModel, _ section: SIMD3<Int>, _ m: inout MeshData) {
+        var flat = w; flat.light = nil; flat.tints = nil
+        buildSpecials(flat,section,FlatFaceSource(),&m,includeFluids: false)
+    }
     static func uv(_ dir: Int, _ p: SIMD3<Float>, _ k: FaceKey) -> SIMD3<Float> {
         var u: Float, v: Float
         switch dir {
@@ -158,13 +196,14 @@ public enum GreedyMesher {
         if k.uvMap & 2 != 0 { u = -u }; if k.uvMap & 4 != 0 { v = -v }
         return SIMD3(u,v,Float(k.layer >= 0 && k.random != 0 ? k.layer+4096*Int(k.random) : k.layer))
     }
-    static func emit(_ m: inout MeshData, _ corners: [SIMD3<Float>], _ k: FaceKey, _ positive: Bool, _ doubleSided: Bool, _ dir: Int? = nil, _ b: SIMD3<Int> = .zero) {
+    static func emit(_ m: inout MeshData, _ corners: [SIMD3<Float>], _ k: FaceKey, _ positive: Bool, _ doubleSided: Bool, _ dir: Int? = nil, _ b: SIMD3<Int> = .zero, _ col: Quad4? = nil, _ flip: Bool = false) {
         let s = m.verts.count
         m.verts.append(contentsOf: corners)
         if let dir { let base = SIMD3<Float>(Float(b.x),Float(b.y),Float(b.z)); m.uvs.append(contentsOf: corners.map { uv(dir,$0-base,k) }) }
         else { m.uvs.append(contentsOf: [SIMD3(0,0,Float(k.layer)),SIMD3(1,0,Float(k.layer)),SIMD3(1,1,Float(k.layer)),SIMD3(0,1,Float(k.layer))]) }
-        m.colors.append(contentsOf: repeatElement(k.color,count: 4)); m.light.append(contentsOf: repeatElement(240,count: 4))
-        var indices = (positive ? [0,1,2,0,2,3] : [0,2,1,0,3,2]).map { $0+s }
+        m.addColors(col ?? Quad4(k.color))
+        let front = flip ? (positive ? [0,1,3,1,2,3] : [0,3,1,1,3,2]) : (positive ? [0,1,2,0,2,3] : [0,2,1,0,3,2])
+        var indices = front.map { $0+s }
         if doubleSided { indices.append(contentsOf: [s,s+2,s+1,s,s+3,s+2]) }
         if k.transparent { m.transparent.append(contentsOf: indices) } else { m.opaque.append(contentsOf: indices) }
     }

@@ -6,6 +6,8 @@ public enum SnapshotError: Error, Sendable, CustomStringConvertible {
 
 public enum SnapshotLimits {
     public static let hardMaxBlocks = 352 * 384 * 352
+    /// Inclusive wire-coordinate ceiling, in the field's units (blocks or biome quarts).
+    public static let maxCoordinate = 1 << 26
 
     /// Allow 25% headroom over advertised limits, without exceeding the client ceiling.
     static func allocationLimit(for maxBlocks: Int?) -> Int {
@@ -29,6 +31,9 @@ enum SnapshotFields {
         guard let a = o.a(key) else { throw SnapshotError.invalid("missing \(key)") }
         let v = try ints(a)
         guard v.count == 3 else { throw SnapshotError.invalid("\(key) must have three integers") }
+        guard v.allSatisfy({ $0 >= -SnapshotLimits.maxCoordinate && $0 <= SnapshotLimits.maxCoordinate }) else {
+            throw SnapshotError.invalid("\(key) exceeds coordinate limit (+/-\(SnapshotLimits.maxCoordinate))")
+        }
         return SIMD3(v[0],v[1],v[2])
     }
     static func integer(_ o: JSONObject, _ key: String, _ fallback: Int? = nil) throws -> Int {

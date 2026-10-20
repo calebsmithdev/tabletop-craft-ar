@@ -1,6 +1,7 @@
 import CompositorServices
 import OSLog
 import SwiftUI
+import UniformTypeIdentifiers
 import TabletopSpatial
 import TabletopCore
 
@@ -57,7 +58,7 @@ struct TableContent: CompositorContent {
         CompositorLayer(configuration: TableLayerConfiguration()) { @MainActor layer in
             let control = model.control ?? RenderControl()
             let generation = model.generation
-            TableRenderLoop.start(layer: layer, control: control, scene: model.connection.scene) { error in
+            TableRenderLoop.start(layer: layer, control: control, scene: model.connection.scene, eyeProbe: model.connection.session.eyeProbe) { error in
                 guard model.generation == generation else { return }
                 model.logger.notice("Renderer finished")
                 if let error { model.message = "Renderer failed: \(error)" }
@@ -72,14 +73,16 @@ struct TableContent: CompositorContent {
 
 struct LauncherView: View {
     @Bindable var model: TableSession
+    @State private var importingPack = false
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         @Bindable var connection = model.connection
-        VStack(alignment: .leading, spacing: 14) {
+        ScrollView { VStack(alignment: .leading, spacing: 14) {
             Text("TabletopCraft").font(.largeTitle)
-            Text("Live tabletop · M1").font(.title3)
+            Text("Live tabletop · M3").font(.title3)
             TextField("Server host or ws://host:8765/tabletop", text: $connection.address)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .accessibilityIdentifier("serverAddress")
@@ -101,6 +104,8 @@ struct LauncherView: View {
                 GridRow { Text("World"); Text(connection.status.world.isEmpty ? "—" : connection.status.world) }
                 GridRow { Text("Region"); Text(regionText(connection.status.dims)) }
                 GridRow { Text("Snapshot"); Text(connection.status.loading) }
+                GridRow { Text("PACK"); Text(connection.status.pack) }
+                if !connection.status.assets.isEmpty { GridRow { Text("ASSETS"); Text(connection.status.assets) } }
                 GridRow { Text("Pairing"); Text(connection.status.paired ? (connection.status.tokenSaved ? "Trusted · saved in Keychain" : "Trusted · token not saved") : "Not paired") }
             }.font(.callout.monospacedDigit())
             if !connection.status.lastError.isEmpty { Text(connection.status.lastError).foregroundStyle(.orange).font(.caption) }
@@ -116,6 +121,24 @@ struct LauncherView: View {
                         .font(.caption)
                 }.padding(16).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
             }
+            HStack {
+                Button(connection.status.packLoading ? "Loading pack…" : "Import pack.zip / client jar") { importingPack = true }
+                    .disabled(connection.status.packLoading)
+                if connection.manualPack || connection.status.pack.contains("disabled") || connection.status.pack.contains("Render error") { Button("Use server pack") { connection.useServerPack() } }
+            }
+            Text("Use your own game files. A trusted server can deliver its pack automatically.")
+                .font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("Advanced") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Mipmaps", isOn: $connection.mipmaps)
+                    Toggle("Smooth lighting", isOn: $connection.smoothLighting)
+                    Toggle("Inner leaves faces", isOn: $connection.leavesInner)
+                    HStack { Text("Minimum light"); Slider(value: $connection.minLight, in: 0...1, step: 0.05); Text(connection.minLight, format: .number.precision(.fractionLength(2))) }
+                    HStack { Text("Brightness"); Slider(value: $connection.brightness, in: 0...1, step: 0.05); Text(connection.brightness, format: .number.precision(.fractionLength(2))) }
+                    Stepper("Mesh workers: \(connection.meshWorkers)", value: $connection.meshWorkers, in: 1...8)
+                    Button("Apply settings") { connection.applySettings() }
+                }.padding(.top, 8)
+            }
             Text(model.message).multilineTextAlignment(.center)
             HStack {
                 Button("Open table") { Task { await openTable() } }
@@ -128,7 +151,8 @@ struct LauncherView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(32)
-        .frame(width: 600)
+        }.frame(width: 640, height: 800)
+        .fileImporter(isPresented: $importingPack, allowedContentTypes: [.zip, UTType(filenameExtension: "jar") ?? .data, .data], onCompletion: connection.importPack)
         .onChange(of: model.shouldDismiss) { _, shouldDismiss in
             if shouldDismiss { Task { await closeTable() } }
         }
@@ -161,6 +185,9 @@ struct LauncherView: View {
             model.state = .open
             model.message = "Table open. The miniature sits 0.75 m ahead, below eye level."
             model.logger.notice("Table opened")
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-hideLauncherOnOpen") { dismissWindow(id: "launcher") }
+            #endif
             if model.shouldDismiss || model.scenePhase == .background { await closeTable() }
         case .userCancelled:
             model.control?.stop()

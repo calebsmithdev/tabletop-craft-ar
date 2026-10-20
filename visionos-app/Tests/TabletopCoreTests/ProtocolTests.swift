@@ -90,7 +90,7 @@ struct ProtocolTests {
         var wrapped = built
         for k in ["v", "seq", "t"] { wrapped[k] = hello[k] }
         #expect(try Json.parse(Json.stringify(wrapped)) == .object(hello))
-        #expect(Protocol.capabilities == ["rle_palette_v1", "avatar", "light_v1", "biomes_v1", "sections_v1", "pair_v1"])
+        #expect(Protocol.capabilities == ["rle_palette_v1", "avatar", "light_v1", "biomes_v1", "sections_v1", "pair_v1", "assets_v1"])
         let error = try protocolFixture("error")
         try compare("error", Protocol.error(error.s("code") ?? "", message: error.s("message") ?? "", refSeq: UInt32(error.i("ref_seq")), fatal: error.b("fatal")))
     }

@@ -37,6 +37,9 @@ public struct SnapshotAssembler: Sendable {
             let allocationLimit = SnapshotLimits.allocationLimit(for: maxBlocks)
             let dims = try SnapshotFields.vector(m,"dims")
             _ = try SnapshotFields.volume(dims,maxBlocks: allocationLimit)
+            _ = try SnapshotFields.vector(m,"origin")
+            if let biomes = m.o("biomes") { _ = try SnapshotFields.vector(biomes,"q_origin") }
+            if m["view_margin"] != nil { _ = try SnapshotFields.vector(m,"view_margin") }
             var messages = [m]
             let sectioned = m.s("encoding") == SectionedSnapshot.encoding
             if sectioned {

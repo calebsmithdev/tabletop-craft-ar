@@ -38,6 +38,22 @@ public actor TableRenderLoop {
     private let tracking = WorldTrackingProvider()
     private let queue: MTLCommandQueue
     private let batches: BatchRenderer
+    private let eyeProbe: EyeProbe
+    private var probeReader = EyeProbeReader()
+    private var eyeFilter = EyeMediumFilter()
+    private var eyeGeneration: UInt64?
+    private var eye = SIMD3<Float>.zero
+    private var eyeLook = EyeLook()
+    private var eyeTime = ProcessInfo.processInfo.systemUptime
+    private let animationStart = ProcessInfo.processInfo.systemUptime
+    private var maxAnimationMs = 0.0
+    private var monoViewports = [MTLViewport(originX: 0, originY: 0, width: 1, height: 1, znear: 0, zfar: 1)]
+    private var stereoViewports = [MTLViewport(originX: 0, originY: 0, width: 1, height: 1, znear: 0, zfar: 1),
+                                   MTLViewport(originX: 0, originY: 0, width: 1, height: 1, znear: 0, zfar: 1)]
+    #if DEBUG
+    private var debugEyePlaced = false
+    private let debugEyeBlock: SIMD3<Float>?
+    #endif
     private let cube: CubeRenderer?
     private var previousFrame: ContinuousClock.Instant?
     private var perfStart = ContinuousClock.now
@@ -51,9 +67,17 @@ public actor TableRenderLoop {
     private var table: TableFrame?
     private var anchorAvailable: Bool?
 
-    private init(handoff: LayerHandoff, control: RenderControl, scene: BatchScene) throws {
+    private init(handoff: LayerHandoff, control: RenderControl, scene: BatchScene, eyeProbe: EyeProbe) throws {
         layer = handoff.layer
-        self.control = control
+        self.control = control; self.eyeProbe = eyeProbe
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-debugEyeBlock"), args.count > i+3,
+           let x = Float(args[i+1]), let y = Float(args[i+2]), let z = Float(args[i+3]), x.isFinite, y.isFinite, z.isFinite {
+            debugEyeBlock = [x,y,z]
+        } else { debugEyeBlock = nil }
+        #endif
+        frameIntervals.reserveCapacity(2048)
         guard let queue = layer.device.makeCommandQueue() else { throw RenderError.resourceAllocation }
         self.queue = queue
         batches = try BatchRenderer(scene: scene, device: layer.device, colorFormat: layer.configuration.colorFormat,
@@ -68,12 +92,12 @@ public actor TableRenderLoop {
     }
 
     @MainActor
-    public static func start(layer: sending LayerRenderer, control: RenderControl, scene: BatchScene,
+    public static func start(layer: sending LayerRenderer, control: RenderControl, scene: BatchScene, eyeProbe: EyeProbe,
                              didStop: @escaping @MainActor @Sendable (String?) -> Void) {
         let handoff = LayerHandoff(layer: layer)
         Task(executorPreference: RendererTaskExecutor.shared) {
             do {
-                let renderer = try TableRenderLoop(handoff: handoff, control: control, scene: scene)
+                let renderer = try TableRenderLoop(handoff: handoff, control: control, scene: scene, eyeProbe: eyeProbe)
                 await renderer.run()
                 await didStop(nil)
             } catch {
@@ -129,6 +153,7 @@ public actor TableRenderLoop {
         guard !control.isStopped else { return }
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty, let commands = queue.makeCommandBuffer() else { return }
+        maxAnimationMs = max(maxAnimationMs, batches.animate(commands: commands, seconds: ProcessInfo.processInfo.systemUptime - animationStart))
         recordFrame()
         frame.startSubmission()
         for drawable in drawables {
@@ -136,7 +161,12 @@ public actor TableRenderLoop {
             let timestamp = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
             drawable.deviceAnchor = tracking.queryDeviceAnchor(atTimestamp: timestamp)
             if table == nil, let anchor = drawable.deviceAnchor, anchor.isTracked {
-                let placed = TableFrame.inFront(of: anchor.originFromAnchorTransform)
+                #if DEBUG
+                let distance = Self.debugFloat("-debugTableDistance") ?? 0.75
+                #else
+                let distance: Float = 0.75
+                #endif
+                let placed = TableFrame.inFront(of: anchor.originFromAnchorTransform, forward: distance)
                 table = placed
                 logger.notice("Table placed at \(String(describing: placed.originFromTable.columns.3), privacy: .public)")
             }
@@ -146,6 +176,7 @@ public actor TableRenderLoop {
                 let position = drawable.deviceAnchor?.originFromAnchorTransform.columns.3 ?? SIMD4<Float>(0, 0, 0, 1)
                 logger.notice("Device anchor available=\(available) position=\(String(describing: position), privacy: .public)")
             }
+            updateEye(drawable: drawable)
             encode(drawable: drawable, commands: commands)
             drawable.encodePresent(commandBuffer: commands)
         }
@@ -159,6 +190,47 @@ public actor TableRenderLoop {
         commands.commit()
         frame.endSubmission()
     }
+
+    private func updateEye(drawable: LayerRenderer.Drawable) {
+        let generation = batches.visibleGeneration
+        let incoming = generation.flatMap { eyeProbe.latest(generation: $0) }
+        if eyeGeneration != generation {
+            eyeFilter = EyeMediumFilter(); eyeLook = EyeLook(); eyeGeneration = generation
+        }
+        guard let probe = probeReader.resolve(incoming, visibleGeneration: generation) else {
+            return
+        }
+        guard var table,
+              let anchor = drawable.deviceAnchor else { return }
+        let head = anchor.originFromAnchorTransform.columns.3
+        #if DEBUG
+        if !debugEyePlaced, let debugEyeBlock, probe.neighborhood.loaded {
+            let local = (debugEyeBlock - probe.center) * probe.blockSize
+            let offset = table.originFromTable * SIMD4<Float>(local,0)
+            table.originFromTable.columns.3 = SIMD4<Float>(head.x-offset.x, head.y-offset.y, head.z-offset.z, 1)
+            self.table = table; debugEyePlaced = true
+            logger.notice("EYE debug table placement block=(\(debugEyeBlock.x, privacy: .public), \(debugEyeBlock.y, privacy: .public), \(debugEyeBlock.z, privacy: .public))")
+        }
+        #endif
+        let p = table.tableFromOrigin * head
+        eye = SIMD3(p.x,p.y,p.z)
+        let block = eye / probe.blockSize + probe.center
+        eyeProbe.setHead(eye)
+        // An outrun is a missing sample, not an observation of air. Preserve
+        // medium, fade and water vision until the actor publishes this head.
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = Float(max(0, min(0.1, now-eyeTime))); eyeTime = now
+        eyeLook = eyeFilter.update(probe.neighborhood,at: block,blockSizeM: probe.blockSize,dt: dt)
+        if eyeFilter.changed { logger.notice("EYE \(self.eyeFilter.medium.rawValue, privacy: .public)") }
+    }
+
+    #if DEBUG
+    private static func debugFloat(_ name: String) -> Float? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: name), args.indices.contains(i+1), let value = Float(args[i+1]), value.isFinite else { return nil }
+        return value
+    }
+    #endif
 
     private func recordFrame() {
         let now = ContinuousClock.now
@@ -178,17 +250,17 @@ public actor TableRenderLoop {
         guard ms(perfStart.duration(to: now)) >= 5000, !frameIntervals.isEmpty else { return }
         let sorted = frameIntervals.sorted()
         func percentile(_ fraction: Double) -> Double { sorted[min(sorted.count-1, Int(Double(sorted.count-1)*fraction))] }
-        logger.notice("PERF frames=\(sorted.count) interval_ms p50=\(percentile(0.5)) p95=\(percentile(0.95)) p99=\(percentile(0.99)) max=\(sorted.last!) upload_max_ms=\(self.maxUploadMs) hitches=\(self.hitchCount)")
+        logger.notice("PERF frames=\(sorted.count) interval_ms p50=\(percentile(0.5)) p95=\(percentile(0.95)) p99=\(percentile(0.99)) max=\(sorted.last!) upload_max_ms=\(self.maxUploadMs) animation_max_ms=\(self.maxAnimationMs) hitches=\(self.hitchCount)")
         frameIntervals.removeAll(keepingCapacity: true)
-        perfStart = now; maxUploadMs = 0; hitchCount = 0
+        perfStart = now; maxUploadMs = 0; maxAnimationMs = 0; hitchCount = 0
     }
 
     private func encode(drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer) {
         let views = StereoViews(drawable: drawable)
         let layered = layer.configuration.layout == .layered
-        let passes = layered ? [Array(drawable.views.indices)] : drawable.views.indices.map { [$0] }
-        for indices in passes {
-            guard let first = indices.first else { continue }
+        for passIndex in 0..<(layered ? 1 : drawable.views.count) {
+            let first = layered ? 0 : passIndex
+            let count = layered ? drawable.views.count : 1
             let textureMap = drawable.views[first].textureMap
             let textureIndex = textureMap.textureIndex
             let pass = MTLRenderPassDescriptor()
@@ -209,18 +281,25 @@ public actor TableRenderLoop {
             pass.rasterizationRateMap = rateMaps.indices.contains(textureIndex) ? rateMaps[textureIndex] : rateMaps.first
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
             encoder.label = "Tabletop world batches"
-            encoder.setViewports(indices.map { drawable.views[$0].textureMap.viewport })
-            if layered && indices.count > 1 {
-                var mappings = indices.enumerated().map { slot, index in
-                    MTLVertexAmplificationViewMapping(viewportArrayIndexOffset: UInt32(slot),
-                        renderTargetArrayIndexOffset: UInt32(drawable.views[index].textureMap.sliceIndex))
+            if count > 1 {
+                stereoViewports[0] = drawable.views[0].textureMap.viewport
+                stereoViewports[1] = drawable.views[1].textureMap.viewport
+                encoder.setViewports(stereoViewports)
+            } else {
+                monoViewports[0] = drawable.views[first].textureMap.viewport
+                encoder.setViewports(monoViewports)
+            }
+            if layered && count > 1 {
+                var mappings = (MTLVertexAmplificationViewMapping(viewportArrayIndexOffset: 0, renderTargetArrayIndexOffset: UInt32(drawable.views[0].textureMap.sliceIndex)),
+                                MTLVertexAmplificationViewMapping(viewportArrayIndexOffset: 1, renderTargetArrayIndexOffset: UInt32(drawable.views[1].textureMap.sliceIndex)))
+                withUnsafePointer(to: &mappings) { pointer in
+                    pointer.withMemoryRebound(to: MTLVertexAmplificationViewMapping.self, capacity: 2) { encoder.setVertexAmplificationCount(count, viewMappings: $0) }
                 }
-                encoder.setVertexAmplificationCount(indices.count, viewMappings: &mappings)
             }
             if let table {
-                let uniforms = CubeUniforms(clipFromOrigin: indices.map { views.clipFromOrigin[$0] },
+                let uniforms = CubeUniforms(leftClipFromOrigin: views[first], rightClipFromOrigin: views[count > 1 ? 1 : first],
                                             originFromTable: table.originFromTable)
-                batches.draw(encoder: encoder, uniforms: uniforms)
+                batches.draw(encoder: encoder, uniforms: uniforms, eye: eye, medium: eyeFilter.medium, look: eyeLook)
                 cube?.draw(encoder: encoder, uniforms: uniforms)
             }
             encoder.endEncoding()

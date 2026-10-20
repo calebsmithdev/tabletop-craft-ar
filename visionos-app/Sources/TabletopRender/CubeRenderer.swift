@@ -8,6 +8,13 @@ public struct CubeUniforms {
     public var rightClipFromOrigin: simd_float4x4
     public var originFromTable: simd_float4x4
 
+    public init(leftClipFromOrigin: simd_float4x4, rightClipFromOrigin: simd_float4x4,
+                originFromTable: simd_float4x4) {
+        self.leftClipFromOrigin = leftClipFromOrigin
+        self.rightClipFromOrigin = rightClipFromOrigin
+        self.originFromTable = originFromTable
+    }
+
     public init(clipFromOrigin: [simd_float4x4], originFromTable: simd_float4x4) {
         precondition(!clipFromOrigin.isEmpty && clipFromOrigin.count <= 2)
         leftClipFromOrigin = clipFromOrigin[0]

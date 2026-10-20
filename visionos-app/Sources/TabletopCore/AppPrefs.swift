@@ -33,6 +33,12 @@ public struct AppPrefs: Sendable {
     public static let sharedKeys = ["block_size_m", "area_width", "show_hud", "volume", "sound"]
     public var server: String?
     public var meshWorkers = 3
+    public var manualPack = false
+    public var mipmaps = true
+    public var smoothLighting = true
+    public var minLight: Float = 0.2
+    public var brightness: Float = 1
+    public var leavesInner = true
     public var blockSizeM: Float?
     public var areaWidth = 0
     public var showHud: Bool?
@@ -55,6 +61,12 @@ public struct AppPrefs: Sendable {
         if case .number(let bs) = m["block_size_m"], bs > 0 { p.blockSizeM = Float(bs) }
         p.server = m.s("server")
         p.meshWorkers = max(1, min(8, m.i("mesh_workers", 3)))
+        p.manualPack = m.b("manual_pack", false)
+        p.mipmaps = m.b("mipmaps", true)
+        p.smoothLighting = m.b("smooth_lighting", true)
+        p.leavesInner = m.b("leaves_inner", true)
+        p.minLight = Float(max(-1, min(1, m.d("min_light", 0.2))))
+        p.brightness = Float(max(0, min(1, m.d("brightness", 1))))
         p.areaWidth = max(0, m.i("area_width"))
         if case .bool(let h) = m["show_hud"] { p.showHud = h }
         if case .number(let v) = m["volume"] { p.volume = Float(max(0, min(1, v))) }
@@ -80,6 +92,12 @@ public struct AppPrefs: Sendable {
         var d: JSONObject = ["v": .number(Double(Self.version))]
         if let server, !server.isEmpty { d["server"] = .string(server) }
         d["mesh_workers"] = .number(Double(meshWorkers))
+        d["manual_pack"] = .bool(manualPack)
+        d["mipmaps"] = .bool(mipmaps)
+        d["smooth_lighting"] = .bool(smoothLighting)
+        d["leaves_inner"] = .bool(leavesInner)
+        d["min_light"] = rounded(minLight, 1_000)
+        d["brightness"] = rounded(brightness, 1_000)
         if let v = blockSizeM { d["block_size_m"] = rounded(v, 1_000_000) }
         if areaWidth > 0 { d["area_width"] = .number(Double(areaWidth)) }
         if let v = showHud { d["show_hud"] = .bool(v) }
