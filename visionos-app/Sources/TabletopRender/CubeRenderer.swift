@@ -1,4 +1,4 @@
-#if os(visionOS)
+#if canImport(Metal)
 import Metal
 import simd
 

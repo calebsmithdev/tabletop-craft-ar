@@ -7,6 +7,8 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Connect to your Minecraft server and find servers on your Wi-Fi.</string>
+    <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
     <key>NSWorldSensingUsageDescription</key><string>Keep your tabletop fixed in the room as you move.</string>
     <key>UIApplicationSceneManifest</key><dict>
         <key>UIApplicationSupportsMultipleScenes</key><true/>

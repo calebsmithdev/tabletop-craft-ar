@@ -37,7 +37,13 @@ public actor TableRenderLoop {
     private let session = ARKitSession()
     private let tracking = WorldTrackingProvider()
     private let queue: MTLCommandQueue
-    private let cube: CubeRenderer
+    private let batches: BatchRenderer
+    private let cube: CubeRenderer?
+    private var previousFrame: ContinuousClock.Instant?
+    private var perfStart = ContinuousClock.now
+    private var frameIntervals: [Double] = []
+    private var maxUploadMs = 0.0
+    private var hitchCount = 0
     private let framesInFlight = DispatchSemaphore(value: 3)
     private let logger = Logger(subsystem: "com.tabletopcraft.ar.visionos", category: "render")
     /// Placed once from the first tracked head pose (TableFrame.inFront), so it works whether
@@ -45,22 +51,29 @@ public actor TableRenderLoop {
     private var table: TableFrame?
     private var anchorAvailable: Bool?
 
-    private init(handoff: LayerHandoff, control: RenderControl) throws {
+    private init(handoff: LayerHandoff, control: RenderControl, scene: BatchScene) throws {
         layer = handoff.layer
         self.control = control
         guard let queue = layer.device.makeCommandQueue() else { throw RenderError.resourceAllocation }
         self.queue = queue
-        cube = try CubeRenderer(device: layer.device, colorFormat: layer.configuration.colorFormat,
-                                depthFormat: layer.configuration.depthFormat, viewCount: layer.properties.viewCount)
+        batches = try BatchRenderer(scene: scene, device: layer.device, colorFormat: layer.configuration.colorFormat,
+                                    depthFormat: layer.configuration.depthFormat, viewCount: layer.properties.viewCount)
+        #if DEBUG
+        let showCube = ProcessInfo.processInfo.arguments.contains("-debugCube")
+        #else
+        let showCube = false
+        #endif
+        cube = showCube ? try CubeRenderer(device: layer.device, colorFormat: layer.configuration.colorFormat,
+                                depthFormat: layer.configuration.depthFormat, viewCount: layer.properties.viewCount) : nil
     }
 
     @MainActor
-    public static func start(layer: sending LayerRenderer, control: RenderControl,
+    public static func start(layer: sending LayerRenderer, control: RenderControl, scene: BatchScene,
                              didStop: @escaping @MainActor @Sendable (String?) -> Void) {
         let handoff = LayerHandoff(layer: layer)
         Task(executorPreference: RendererTaskExecutor.shared) {
             do {
-                let renderer = try TableRenderLoop(handoff: handoff, control: control)
+                let renderer = try TableRenderLoop(handoff: handoff, control: control, scene: scene)
                 await renderer.run()
                 await didStop(nil)
             } catch {
@@ -109,12 +122,14 @@ public actor TableRenderLoop {
         var submitted = false
         defer { if !submitted { framesInFlight.signal() } }
         frame.startUpdate()
+        maxUploadMs = max(maxUploadMs, batches.consumeUploads(budgetMilliseconds: 3))
         frame.endUpdate()
         guard let timing = frame.predictTiming() else { return }
         LayerRenderer.Clock().wait(until: timing.optimalInputTime)
         guard !control.isStopped else { return }
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty, let commands = queue.makeCommandBuffer() else { return }
+        recordFrame()
         frame.startSubmission()
         for drawable in drawables {
             let duration = LayerRenderer.Clock.Instant.epoch.duration(to: drawable.frameTiming.presentationTime).components
@@ -145,6 +160,29 @@ public actor TableRenderLoop {
         frame.endSubmission()
     }
 
+    private func recordFrame() {
+        let now = ContinuousClock.now
+        func ms(_ duration: Duration) -> Double {
+            let c = duration.components
+            return Double(c.seconds)*1000 + Double(c.attoseconds)/1e15
+        }
+        if let previousFrame {
+            let interval = ms(previousFrame.duration(to: now))
+            frameIntervals.append(interval)
+            if interval > 50 {
+                hitchCount += 1
+                logger.notice("HITCH interval_ms=\(interval) upload_max_ms=\(self.maxUploadMs)")
+            }
+        }
+        previousFrame = now
+        guard ms(perfStart.duration(to: now)) >= 5000, !frameIntervals.isEmpty else { return }
+        let sorted = frameIntervals.sorted()
+        func percentile(_ fraction: Double) -> Double { sorted[min(sorted.count-1, Int(Double(sorted.count-1)*fraction))] }
+        logger.notice("PERF frames=\(sorted.count) interval_ms p50=\(percentile(0.5)) p95=\(percentile(0.95)) p99=\(percentile(0.99)) max=\(sorted.last!) upload_max_ms=\(self.maxUploadMs) hitches=\(self.hitchCount)")
+        frameIntervals.removeAll(keepingCapacity: true)
+        perfStart = now; maxUploadMs = 0; hitchCount = 0
+    }
+
     private func encode(drawable: LayerRenderer.Drawable, commands: MTLCommandBuffer) {
         let views = StereoViews(drawable: drawable)
         let layered = layer.configuration.layout == .layered
@@ -170,7 +208,7 @@ public actor TableRenderLoop {
             let rateMaps = drawable.rasterizationRateMaps
             pass.rasterizationRateMap = rateMaps.indices.contains(textureIndex) ? rateMaps[textureIndex] : rateMaps.first
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
-            encoder.label = "Tabletop cube"
+            encoder.label = "Tabletop world batches"
             encoder.setViewports(indices.map { drawable.views[$0].textureMap.viewport })
             if layered && indices.count > 1 {
                 var mappings = indices.enumerated().map { slot, index in
@@ -180,8 +218,10 @@ public actor TableRenderLoop {
                 encoder.setVertexAmplificationCount(indices.count, viewMappings: &mappings)
             }
             if let table {
-                cube.draw(encoder: encoder, uniforms: CubeUniforms(clipFromOrigin: indices.map { views.clipFromOrigin[$0] },
-                           originFromTable: table.originFromTable))
+                let uniforms = CubeUniforms(clipFromOrigin: indices.map { views.clipFromOrigin[$0] },
+                                            originFromTable: table.originFromTable)
+                batches.draw(encoder: encoder, uniforms: uniforms)
+                cube?.draw(encoder: encoder, uniforms: uniforms)
             }
             encoder.endEncoding()
         }
